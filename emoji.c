@@ -1,480 +1,486 @@
 #include <windows.h>
 #include <stdio.h>
-#include <string.h>
-#include <math.h>
-#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "schrift.h"
 #include "schrift.c"
-#include "util/utf8_to_utf32.h"
 
-#define WINDOW_WIDTH  1200
-#define WINDOW_HEIGHT 880
-#define SCALE_FACTOR  2
-#define EMOJI_SIZE    32  // Size of each emoji in pixels
-#define COLS_PER_ROW  20  // Number of emojis per row
+// Configuration
+#define EMOJI_VIEWER_WIDTH  3200
+#define EMOJI_VIEWER_HEIGHT 1200
+#define EMOJI_SIZE          48
+#define EMOJIS_PER_ROW      50
+#define EMOJI_MARGIN        8
+#define SCROLL_STEP         20
 
 typedef struct {
-    uint32_t* pixels;  // ARGB format
-    int width;
-    int height;
-} backbuffer_t;
+    uint32_t* pixels;        // RGBA pixel data (pre-rendered with colors)
+    int width, height;       // Dimensions in pixels
+    uint16_t glyphID;        // Original glyph ID
+} Emoji;
 
-static backbuffer_t backbuffer = {0};
-
-/* Structure to hold rendered emoji data */
 typedef struct {
-    uint8_t *pixels;    // Grayscale pixel data
-    int width;          // Width of the rendered emoji
-    int height;         // Height of the rendered emoji
-    uint32_t *colors;   // Array of ARGB colors from CPAL
-    uint16_t colorCount;// Number of colors in the palette
-} EmojiRender;
+    uint32_t* pixels;        // ARGB backbuffer
+    int width, height;       // Window dimensions
+    int scrollOffset;        // Current scroll position
+    int maxScroll;           // Maximum scroll position
+    Emoji* emojis;          // Array of loaded emojis
+    uint32_t emojiCount;     // Number of loaded emojis
+    SFT_Font* font;         // Loaded font
+    BITMAPINFO bmi;         // DIB info for rendering
+    SFT sft;               // SFT context for rendering
+} EmojiViewer;
 
-// Function declarations for emoji rendering
-static int sft_render_all_emojis(const SFT *sft, EmojiRender **emojis, uint16_t *emojiCount);
-static void sft_free_emojis(EmojiRender *emojis, uint16_t emojiCount);
-static void draw_emoji(EmojiRender *emoji, int x, int y);
+// Function declarations
+static bool emoji_viewer_init(EmojiViewer* viewer);
+static void emoji_viewer_cleanup(EmojiViewer* viewer);
+static void emoji_viewer_render(EmojiViewer* viewer, HDC hdc);
+static void emoji_viewer_handle_scroll(EmojiViewer* viewer, int delta);
+static bool load_emoji_font(EmojiViewer* viewer);
+static bool render_all_emojis(EmojiViewer* viewer);
+static bool render_emoji(EmojiViewer* viewer, Emoji* emoji, uint16_t glyphID, uint16_t* layerGlyphs, uint16_t* colorIndices, uint16_t layerCount, uint32_t* palette);
+static void draw_emoji(const Emoji* emoji, EmojiViewer* viewer, int x, int y);
 
-// Initialize the backbuffer with the specified dimensions
-static void init_backbuffer(int width, int height) {
-    if (backbuffer.pixels) free(backbuffer.pixels);
-    backbuffer.pixels = (uint32_t*)calloc(width * height, sizeof(uint32_t));
-    backbuffer.width = width;
-    backbuffer.height = height;
+// Initialize the emoji viewer
+static bool emoji_viewer_init(EmojiViewer* viewer) {
+    if (!viewer) return false;
+
+    memset(viewer, 0, sizeof(EmojiViewer));
+    viewer->width = EMOJI_VIEWER_WIDTH;
+    viewer->height = EMOJI_VIEWER_HEIGHT;
+
+    // Initialize backbuffer
+    viewer->pixels = calloc(viewer->width * viewer->height, sizeof(uint32_t));
+    if (!viewer->pixels) return false;
+
+    // Setup bitmap info
+    viewer->bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    viewer->bmi.bmiHeader.biWidth = viewer->width;
+    viewer->bmi.bmiHeader.biHeight = -viewer->height; // Top-down
+    viewer->bmi.bmiHeader.biPlanes = 1;
+    viewer->bmi.bmiHeader.biBitCount = 32;
+    viewer->bmi.bmiHeader.biCompression = BI_RGB;
+
+    // Setup SFT
+    viewer->sft.xScale = EMOJI_SIZE;
+    viewer->sft.yScale = EMOJI_SIZE;
+    viewer->sft.flags = SFT_DOWNWARD_Y;
+
+    // Load font and emojis
+    if (!load_emoji_font(viewer) || !render_all_emojis(viewer)) {
+        emoji_viewer_cleanup(viewer);
+        return false;
+    }
+
+    return true;
 }
 
-// Clear the backbuffer to a specified color
-static void clear_backbuffer(uint32_t color) {
-    for (int i = 0; i < backbuffer.width * backbuffer.height; i++) {
-        backbuffer.pixels[i] = color;
+// Clean up resources
+static void emoji_viewer_cleanup(EmojiViewer* viewer) {
+    if (!viewer) return;
+
+    if (viewer->pixels) {
+        free(viewer->pixels);
+        viewer->pixels = NULL;
+    }
+
+    if (viewer->emojis) {
+        for (uint32_t i = 0; i < viewer->emojiCount; i++) {
+            free(viewer->emojis[i].pixels);
+        }
+        free(viewer->emojis);
+        viewer->emojis = NULL;
+    }
+
+    if (viewer->font) {
+        sft_freefont(viewer->font);
+        viewer->font = NULL;
     }
 }
 
-static int
-sft_render_all_emojis(const SFT *sft, EmojiRender **emojis, uint16_t *emojiCount)
-{
+// Load emoji font from common locations
+static bool load_emoji_font(EmojiViewer* viewer) {
+    const char* fontPaths[] = {
+        "seguiemj.ttf",
+        "C:\\Windows\\Fonts\\seguiemj.ttf",
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+        NULL
+    };
+
+    for (int i = 0; fontPaths[i]; i++) {
+        viewer->font = sft_loadfile(fontPaths[i]);
+        if (viewer->font) {
+            printf("Loaded font from: %s\n", fontPaths[i]);
+            viewer->sft.font = viewer->font;
+            return true;
+        }
+    }
+
+    fprintf(stderr, "Failed to load emoji font\n");
+    return false;
+}
+
+// Render all emojis from the font with proper colors
+static bool render_all_emojis(EmojiViewer* viewer) {
+    if (!viewer || !viewer->font) return false;
+
     uint_fast32_t colrOffset, cpalOffset;
-    SFT_COLR colrTable = {0};
-    SFT_CPAL cpalTable = {0};
-    uint16_t i, j;
-
-    *emojis = NULL;
-    *emojiCount = 0;
-
-    printf("Starting sft_render_all_emojis\n");
-
-    if (gettable(sft->font, "COLR", &colrOffset) < 0) {
-        printf("No COLR table found\n");
-        return -1;
-    }
-
-    if (gettable(sft->font, "CPAL", &cpalOffset) < 0) {
-        printf("No CPAL table found\n");
-        return -1;
+    if (gettable(viewer->font, "COLR", &colrOffset) < 0 || 
+        gettable(viewer->font, "CPAL", &cpalOffset) < 0) {
+        fprintf(stderr, "Font doesn't contain color emoji tables\n");
+        return false;
     }
 
     // Parse COLR table header
-    if (!is_safe_offset(sft->font, colrOffset, 14)) { // 14 bytes for full header
-        printf("Invalid COLR header offset\n");
-        return -1;
-    }
-    colrTable.version = getu16(sft->font, colrOffset);
-    colrTable.numGlyphs = getu16(sft->font, colrOffset + 2); // numBaseGlyphRecords
-    uint_fast32_t baseGlyphOffset = colrOffset + getu32(sft->font, colrOffset + 4);
-    uint_fast32_t layerOffset = colrOffset + getu32(sft->font, colrOffset + 8);
-    uint16_t numLayerRecords = getu16(sft->font, colrOffset + 12);
-    printf("COLR: version=%u, numBaseGlyphs=%u, numLayerRecords=%u\n", 
-           colrTable.version, colrTable.numGlyphs, numLayerRecords);
-
-    if (colrTable.numGlyphs == 0) {
-        printf("No glyphs in COLR table\n");
-        return 0;
+    if (!is_safe_offset(viewer->font, colrOffset, 14)) {
+        fprintf(stderr, "Invalid COLR table\n");
+        return false;
     }
 
-    colrTable.glyphs = malloc(colrTable.numGlyphs * sizeof(uint16_t));
-    colrTable.layers = malloc(colrTable.numGlyphs * sizeof(uint16_t));
-    if (!colrTable.glyphs || !colrTable.layers) {
-        printf("Failed to allocate COLR glyph/layer arrays\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        return -1;
-    }
+    uint16_t numGlyphs = getu16(viewer->font, colrOffset + 2);
+    uint_fast32_t baseGlyphOffset = colrOffset + getu32(viewer->font, colrOffset + 4);
+    uint_fast32_t layerOffset = colrOffset + getu32(viewer->font, colrOffset + 8);
 
     // Read BaseGlyphRecords
-    uint_fast32_t offset = baseGlyphOffset;
-    uint16_t *firstLayerIndices = malloc(colrTable.numGlyphs * sizeof(uint16_t));
-    if (!firstLayerIndices) {
-        printf("Failed to allocate firstLayerIndices\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        return -1;
+    uint16_t* glyphs = malloc(numGlyphs * sizeof(uint16_t));
+    uint16_t* firstLayers = malloc(numGlyphs * sizeof(uint16_t));
+    uint16_t* layerCounts = malloc(numGlyphs * sizeof(uint16_t));
+    
+    if (!glyphs || !firstLayers || !layerCounts) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(glyphs);
+        free(firstLayers);
+        free(layerCounts);
+        return false;
     }
-    for (i = 0; i < colrTable.numGlyphs; i++) {
-        if (!is_safe_offset(sft->font, offset, 6)) { // 6 bytes per BaseGlyphRecord
-            printf("Invalid offset for BaseGlyphRecord %u\n", i);
-            free(colrTable.glyphs);
-            free(colrTable.layers);
-            free(firstLayerIndices);
-            return -1;
-        }
-        colrTable.glyphs[i] = getu16(sft->font, offset);
-        firstLayerIndices[i] = getu16(sft->font, offset + 2);
-        colrTable.layers[i] = getu16(sft->font, offset + 4);
-        printf("Glyph %u: GID=%u, firstLayer=%u, numLayers=%u\n", 
-               i, colrTable.glyphs[i], firstLayerIndices[i], colrTable.layers[i]);
+
+    uint_fast32_t offset = baseGlyphOffset;
+    for (uint16_t i = 0; i < numGlyphs; i++) {
+        if (!is_safe_offset(viewer->font, offset, 6)) break;
+        glyphs[i] = getu16(viewer->font, offset);
+        firstLayers[i] = getu16(viewer->font, offset + 2);
+        layerCounts[i] = getu16(viewer->font, offset + 4);
         offset += 6;
     }
 
     // Parse CPAL table
-    if (!is_safe_offset(sft->font, cpalOffset, 4)) {
-        printf("Invalid CPAL offset\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        free(firstLayerIndices);
-        return -1;
-    }
-    cpalTable.version = getu16(sft->font, cpalOffset);
-    cpalTable.numPalettes = getu16(sft->font, cpalOffset + 2);
-    printf("CPAL: version=%u, numPalettes=%u\n", cpalTable.version, cpalTable.numPalettes);
-
-    offset = cpalOffset + 4;
-    cpalTable.paletteCount = malloc(cpalTable.numPalettes * sizeof(uint16_t));
-    if (!cpalTable.paletteCount) {
-        printf("Failed to allocate paletteCount\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        free(firstLayerIndices);
-        return -1;
+    if (!is_safe_offset(viewer->font, cpalOffset, 12)) {
+        fprintf(stderr, "Invalid CPAL table\n");
+        free(glyphs);
+        free(firstLayers);
+        free(layerCounts);
+        return false;
     }
 
-    for (i = 0; i < cpalTable.numPalettes; i++) {
-        if (!is_safe_offset(sft->font, offset, 2)) {
-            printf("Invalid offset for palette %u\n", i);
-            free(colrTable.glyphs);
-            free(colrTable.layers);
-            free(firstLayerIndices);
-            free(cpalTable.paletteCount);
-            return -1;
-        }
-        cpalTable.paletteCount[i] = getu16(sft->font, offset);
-        offset += 2;
+    uint16_t numPaletteEntries = getu16(viewer->font, cpalOffset + 4);
+    uint_fast32_t colorArrayOffset = cpalOffset + getu32(viewer->font, cpalOffset + 8);
+
+    // Read color palette (first palette only)
+    uint32_t* palette = malloc(numPaletteEntries * sizeof(uint32_t));
+    if (!palette) {
+        fprintf(stderr, "Failed to allocate palette\n");
+        free(glyphs);
+        free(firstLayers);
+        free(layerCounts);
+        return false;
     }
 
-    cpalTable.palettes = malloc(cpalTable.numPalettes * sizeof(uint32_t*));
-    if (!cpalTable.palettes) {
-        printf("Failed to allocate palettes array\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        free(firstLayerIndices);
-        free(cpalTable.paletteCount);
-        return -1;
+    for (uint16_t i = 0; i < numPaletteEntries; i++) {
+        if (!is_safe_offset(viewer->font, colorArrayOffset + i * 4, 4)) break;
+        uint32_t bgra = getu32(viewer->font, colorArrayOffset + i * 4);
+        // Convert BGRA to RGBA
+        palette[i] = (bgra & 0xFF00FF00) | ((bgra & 0xFF) << 16) | ((bgra >> 16) & 0xFF);
     }
 
-    uint16_t colorCount = cpalTable.paletteCount[0];
-    cpalTable.palettes[0] = malloc(colorCount * sizeof(uint32_t));
-    if (!cpalTable.palettes[0]) {
-        printf("Failed to allocate palette 0\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        free(firstLayerIndices);
-        free(cpalTable.paletteCount);
-        free(cpalTable.palettes);
-        return -1;
+    // Allocate emojis array
+    viewer->emojis = calloc(numGlyphs, sizeof(Emoji));
+    if (!viewer->emojis) {
+        fprintf(stderr, "Failed to allocate emojis array\n");
+        free(glyphs);
+        free(firstLayers);
+        free(layerCounts);
+        free(palette);
+        return false;
     }
+    viewer->emojiCount = numGlyphs;
 
-    for (i = 0; i < colorCount; i++) {
-        if (!is_safe_offset(sft->font, offset, 4)) {
-            printf("Invalid offset for color %u\n", i);
-            free(colrTable.glyphs);
-            free(colrTable.layers);
-            free(firstLayerIndices);
-            free(cpalTable.paletteCount);
-            free(cpalTable.palettes[0]);
-            free(cpalTable.palettes);
-            return -1;
-        }
-        cpalTable.palettes[0][i] = getu32(sft->font, offset);
-        offset += 4;
-    }
-
-    *emojis = calloc(colrTable.numGlyphs, sizeof(EmojiRender));
-    if (!*emojis) {
-        printf("Failed to allocate emojis array\n");
-        free(colrTable.glyphs);
-        free(colrTable.layers);
-        free(firstLayerIndices);
-        free(cpalTable.paletteCount);
-        free(cpalTable.palettes[0]);
-        free(cpalTable.palettes);
-        return -1;
-    }
-    *emojiCount = colrTable.numGlyphs;
-    printf("Allocated %u emojis\n", *emojiCount);
-
-    // Render each emoji
-    offset = layerOffset;
-    for (i = 0; i < colrTable.numGlyphs; i++) {
-        SFT_Glyph glyph = colrTable.glyphs[i];
-        uint16_t layerCount = colrTable.layers[i];
-        uint16_t firstLayer = firstLayerIndices[i];
-        SFT_GMetrics metrics;
-        SFT_Image image = {0};
-
-        if (sft_gmetrics(sft, glyph, &metrics) < 0) {
-            printf("Failed to get metrics for glyph %u\n", i);
+    // For each emoji, read layer information and render
+    for (uint32_t i = 0; i < numGlyphs; i++) {
+        uint16_t layerCount = layerCounts[i];
+        uint16_t* layerGlyphs = malloc(layerCount * sizeof(uint16_t));
+        uint16_t* colorIndices = malloc(layerCount * sizeof(uint16_t));
+        
+        if (!layerGlyphs || !colorIndices) {
+            free(layerGlyphs);
+            free(colorIndices);
             continue;
         }
 
-        image.width = metrics.minWidth;
-        image.height = metrics.minHeight;
-        image.pixels = calloc(image.width * image.height, sizeof(uint8_t));
-        if (!image.pixels) {
-            printf("Failed to allocate pixels for glyph %u\n", i);
+        // Read layer records
+        for (uint16_t j = 0; j < layerCount; j++) {
+            uint_fast32_t layerRecordOffset = layerOffset + (firstLayers[i] + j) * 4;
+            if (!is_safe_offset(viewer->font, layerRecordOffset, 4)) break;
+            layerGlyphs[j] = getu16(viewer->font, layerRecordOffset);
+            colorIndices[j] = getu16(viewer->font, layerRecordOffset + 2);
+        }
+
+        // Render this emoji with all its layers and colors
+        if (!render_emoji(viewer, &viewer->emojis[i], glyphs[i], layerGlyphs, colorIndices, layerCount, palette)) {
+            free(layerGlyphs);
+            free(colorIndices);
             continue;
         }
 
-        if (sft_render(sft, glyph, image) < 0) {
-            printf("Failed to render glyph %u\n", i);
-            free(image.pixels);
-            continue;
-        }
+        free(layerGlyphs);
+        free(colorIndices);
+    }
 
-        (*emojis)[i].pixels = image.pixels;
-        (*emojis)[i].width = image.width;
-        (*emojis)[i].height = image.height;
-        (*emojis)[i].colors = cpalTable.palettes[0];
-        (*emojis)[i].colorCount = colorCount;
+    // Calculate max scroll position
+    int rows = (viewer->emojiCount + EMOJIS_PER_ROW - 1) / EMOJIS_PER_ROW;
+    int row_height = EMOJI_SIZE + EMOJI_MARGIN;
+    viewer->maxScroll = max(0, rows * row_height + EMOJI_MARGIN - viewer->height);
 
-        SFT_COLR_Layer layer = {0};
-        layer.glyphID = glyph;
-        layer.layerCount = layerCount;
-        layer.layerGlyphIDs = malloc(layerCount * sizeof(uint16_t));
-        layer.layerColorIndices = malloc(layerCount * sizeof(uint16_t));
-        if (!layer.layerGlyphIDs || !layer.layerColorIndices) {
-            printf("Failed to allocate layer arrays for glyph %u\n", i);
-            free(layer.layerGlyphIDs);
-            free(layer.layerColorIndices);
-            free(image.pixels);
-            (*emojis)[i].pixels = NULL;
-            continue;
-        }
+    free(glyphs);
+    free(firstLayers);
+    free(layerCounts);
+    free(palette);
 
-        uint_fast32_t layerBase = layerOffset + firstLayer * 4; // 4 bytes per LayerRecord
-        for (j = 0; j < layerCount; j++) {
-            if (!is_safe_offset(sft->font, layerBase + j * 4, 4)) {
-                printf("Invalid layer offset for glyph %u, layer %u\n", i, j);
-                free(layer.layerGlyphIDs);
-                free(layer.layerColorIndices);
-                free(image.pixels);
-                (*emojis)[i].pixels = NULL;
-                goto cleanup;
-            }
-            layer.layerGlyphIDs[j] = getu16(sft->font, layerBase + j * 4);
-            layer.layerColorIndices[j] = getu16(sft->font, layerBase + j * 4 + 2);
+    printf("Successfully rendered %u emojis\n", viewer->emojiCount);
+    return true;
+}
 
-            SFT_Image layerImage = {0};
-            layerImage.width = image.width;
-            layerImage.height = image.height;
-            layerImage.pixels = calloc(layerImage.width * layerImage.height, sizeof(uint8_t));
-            if (!layerImage.pixels) {
-                printf("Failed to allocate layer pixels for glyph %u, layer %u\n", i, j);
-                continue;
-            }
-            if (sft_render(sft, layer.layerGlyphIDs[j], layerImage) == 0) {
-                uint8_t *imagePixels = (uint8_t *)image.pixels;
-                uint8_t *layerPixels = (uint8_t *)layerImage.pixels;
-                for (int k = 0; k < image.width * image.height; k++) {
-                    if (layerPixels[k]) {
-                        imagePixels[k] = layerPixels[k];
+// Render a single emoji with all its layers and proper colors
+static bool render_emoji(EmojiViewer* viewer, Emoji* emoji, uint16_t glyphID, 
+                        uint16_t* layerGlyphs, uint16_t* colorIndices, 
+                        uint16_t layerCount, uint32_t* palette) {
+    if (!viewer || !emoji || layerCount == 0) return false;
+
+    // Get metrics for the base glyph
+    SFT_GMetrics metrics;
+    if (sft_gmetrics(&viewer->sft, glyphID, &metrics) < 0) {
+        return false;
+    }
+
+    emoji->width = metrics.minWidth;
+    emoji->height = metrics.minHeight;
+    emoji->glyphID = glyphID;
+    emoji->pixels = calloc(emoji->width * emoji->height, sizeof(uint32_t));
+    if (!emoji->pixels) return false;
+
+    // Temporary buffer for layer rendering
+    SFT_Image layerImage = {
+        .width = emoji->width,
+        .height = emoji->height,
+        .pixels = calloc(emoji->width * emoji->height, sizeof(uint8_t))
+    };
+    if (!layerImage.pixels) {
+        free(emoji->pixels);
+        return false;
+    }
+
+    // Composite all layers
+    for (uint16_t i = 0; i < layerCount; i++) {
+        // Clear layer image
+        memset(layerImage.pixels, 0, emoji->width * emoji->height * sizeof(uint8_t));
+
+        // Render the layer
+        if (sft_render(&viewer->sft, layerGlyphs[i], layerImage) == 0) {
+            uint32_t color = palette[colorIndices[i] % layerCount];
+            uint8_t a = (color >> 24) & 0xFF;
+            uint8_t r = (color >> 16) & 0xFF;
+            uint8_t g = (color >> 8) & 0xFF;
+            uint8_t b = color & 0xFF;
+
+            // Composite this layer onto the emoji
+            for (int y = 0; y < emoji->height; y++) {
+                for (int x = 0; x < emoji->width; x++) {
+                    uint8_t alpha = ((uint8_t*)layerImage.pixels)[y * emoji->width + x];
+                    if (alpha > 0) {
+                        uint32_t* pixel = &emoji->pixels[y * emoji->width + x];
+                        
+                        // Unpack existing pixel
+                        uint8_t dst_a = (*pixel >> 24) & 0xFF;
+                        uint8_t dst_r = (*pixel >> 16) & 0xFF;
+                        uint8_t dst_g = (*pixel >> 8) & 0xFF;
+                        uint8_t dst_b = *pixel & 0xFF;
+
+                        // Alpha blend
+                        uint8_t out_a = a + dst_a * (255 - a) / 255;
+                        uint8_t out_r = (r * a + dst_r * (255 - a)) / 255;
+                        uint8_t out_g = (g * a + dst_g * (255 - a)) / 255;
+                        uint8_t out_b = (b * a + dst_b * (255 - a)) / 255;
+
+                        *pixel = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
                     }
                 }
             }
-            free(layerImage.pixels);
         }
-
-        free(layer.layerGlyphIDs);
-        free(layer.layerColorIndices);
     }
 
-    free(colrTable.glyphs);
-    free(colrTable.layers);
-    free(firstLayerIndices);
-    free(cpalTable.paletteCount);
-    for (i = 1; i < cpalTable.numPalettes; i++) {
-        free(cpalTable.palettes[i]);
-    }
-    free(cpalTable.palettes);
-    printf("Completed rendering %u emojis\n", *emojiCount);
-    return 0;
+    free(layerImage.pixels);
+    return true;
+}
 
-cleanup:
-    printf("Entering cleanup with emojiCount=%u, emojis=%p\n", *emojiCount, (void*)*emojis);
-    if (*emojis) {
-        for (i = 0; i < *emojiCount; i++) {
-            if ((*emojis)[i].pixels) {
-                free((*emojis)[i].pixels);
+// Render the emoji viewer to the window
+static void emoji_viewer_render(EmojiViewer* viewer, HDC hdc) {
+    if (!viewer || !hdc) return;
+
+    // Clear to white background
+    for (int i = 0; i < viewer->width * viewer->height; i++) {
+        viewer->pixels[i] = 0xFFFFFFFF;
+    }
+
+    // Draw emojis in grid with scroll offset
+    int x = EMOJI_MARGIN;
+    int y = EMOJI_MARGIN - viewer->scrollOffset;
+    int max_height = 0;
+
+    for (uint32_t i = 0; i < viewer->emojiCount; i++) {
+        if (viewer->emojis[i].pixels) {
+            draw_emoji(&viewer->emojis[i], viewer, x, y);
+            x += EMOJI_SIZE + EMOJI_MARGIN;
+            max_height = max(max_height, viewer->emojis[i].height);
+
+            if ((i + 1) % EMOJIS_PER_ROW == 0) {
+                x = EMOJI_MARGIN;
+                y += max_height + EMOJI_MARGIN;
+                max_height = 0;
             }
-        }
-        free(*emojis);
-    }
-    free(colrTable.glyphs);
-    free(colrTable.layers);
-    free(firstLayerIndices);
-    free(cpalTable.paletteCount);
-    for (i = 0; i < cpalTable.numPalettes; i++) {
-        free(cpalTable.palettes[i]);
-    }
-    free(cpalTable.palettes);
-    return -1;
-}
 
-// Function to free the rendered emoji data
-static void
-sft_free_emojis(EmojiRender *emojis, uint16_t emojiCount)
-{
-    if (!emojis) return;
-    for (uint16_t i = 0; i < emojiCount; i++) {
-        free(emojis[i].pixels);
-        // Note: colors array is shared from CPAL table, freed only once
-        if (i == 0) free(emojis[i].colors);
-    }
-    free(emojis);
-}
-
-// Draw an emoji at the specified position with color
-static void draw_emoji(EmojiRender *emoji, int x, int y) {
-    for (int gy = 0; gy < emoji->height; gy++) {
-        for (int gx = 0; gx < emoji->width; gx++) {
-            int buf_x = x + gx;
-            int buf_y = y + gy;
-            if (buf_x >= 0 && buf_x < backbuffer.width && 
-                buf_y >= 0 && buf_y < backbuffer.height) {
-                uint8_t alpha = emoji->pixels[gy * emoji->width + gx];
-                if (alpha > 0) {
-                    // Use the first color from the palette for simplicity
-                    uint32_t color = emoji->colors[0]; // ARGB format
-                    uint32_t fg = color;
-                    uint32_t bg = 0xFFFFFFFF; // White background
-                    uint32_t* dest = &backbuffer.pixels[buf_y * backbuffer.width + buf_x];
-                    uint32_t r = ((fg & 0xFF) * alpha + (bg & 0xFF) * (255 - alpha)) >> 8;
-                    uint32_t g = (((fg >> 8) & 0xFF) * alpha + ((bg >> 8) & 0xFF) * (255 - alpha)) >> 8;
-                    uint32_t b = (((fg >> 16) & 0xFF) * alpha + ((bg >> 16) & 0xFF) * (255 - alpha)) >> 8;
-                    *dest = 0xFF000000 | (b << 16) | (g << 8) | r;
-                }
+            // Stop if we're past the bottom of the window
+            if (y > viewer->height) {
+                break;
             }
         }
     }
+
+    // Update window
+    StretchDIBits(hdc, 0, 0, viewer->width, viewer->height,
+                  0, 0, viewer->width, viewer->height,
+                  viewer->pixels, &viewer->bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
-// Window procedure handling messages
+// Draw a single emoji (already pre-rendered with colors)
+static void draw_emoji(const Emoji* emoji, EmojiViewer* viewer, int x, int y) {
+    if (!emoji || !viewer || !emoji->pixels) return;
+
+    // Only draw if at least partially visible
+    if (y + emoji->height < 0 || y >= viewer->height) return;
+
+    int start_y = max(0, -y);
+    int end_y = min(emoji->height, viewer->height - y);
+
+    for (int ey = start_y; ey < end_y; ey++) {
+        int screen_y = y + ey;
+        if (screen_y < 0 || screen_y >= viewer->height) continue;
+
+        for (int ex = 0; ex < emoji->width; ex++) {
+            int screen_x = x + ex;
+            if (screen_x < 0 || screen_x >= viewer->width) continue;
+
+            uint32_t pixel = emoji->pixels[ey * emoji->width + ex];
+            uint8_t alpha = (pixel >> 24) & 0xFF;
+
+            if (alpha > 0) {
+                // Alpha blend with white background
+                uint32_t bg = viewer->pixels[screen_y * viewer->width + screen_x];
+                uint8_t bg_r = (bg >> 16) & 0xFF;
+                uint8_t bg_g = (bg >> 8) & 0xFF;
+                uint8_t bg_b = bg & 0xFF;
+
+                uint8_t r = (pixel >> 16) & 0xFF;
+                uint8_t g = (pixel >> 8) & 0xFF;
+                uint8_t b = pixel & 0xFF;
+
+                uint8_t out_r = (r * alpha + bg_r * (255 - alpha)) / 255;
+                uint8_t out_g = (g * alpha + bg_g * (255 - alpha)) / 255;
+                uint8_t out_b = (b * alpha + bg_b * (255 - alpha)) / 255;
+
+                viewer->pixels[screen_y * viewer->width + screen_x] = 
+                    0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+            }
+        }
+    }
+}
+
+// Handle mouse wheel scrolling
+static void emoji_viewer_handle_scroll(EmojiViewer* viewer, int delta) {
+    if (!viewer) return;
+
+    viewer->scrollOffset -= delta / WHEEL_DELTA * SCROLL_STEP;
+    viewer->scrollOffset = max(0, min(viewer->scrollOffset, viewer->maxScroll));
+}
+
+// Window procedure
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param) {
-    static SFT sft = {
-        .xScale = EMOJI_SIZE,
-        .yScale = EMOJI_SIZE,
-        .flags = SFT_DOWNWARD_Y
-    };
-    static BITMAPINFO bmi = {0};
-    static EmojiRender *emojis = NULL;
-    static uint16_t emojiCount = 0;
+    static EmojiViewer viewer;
 
     switch (msg) {
         case WM_CREATE: {
-            init_backbuffer(WINDOW_WIDTH, WINDOW_HEIGHT);
-            
-            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = WINDOW_WIDTH;
-            bmi.bmiHeader.biHeight = -WINDOW_HEIGHT;  // Top-down
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-
-            sft.font = sft_loadfile("C:\\Windows\\Fonts\\seguiemj.ttf");
-            if (!sft.font) {
-                MessageBox(NULL, "TTF load failed", "Error", MB_OK | MB_ICONERROR);
+            if (!emoji_viewer_init(&viewer)) {
+                MessageBox(hwnd, "Failed to initialize emoji viewer", "Error", MB_OK | MB_ICONERROR);
                 return -1;
             }
-
-            // Render all emojis
-            if (sft_render_all_emojis(&sft, &emojis, &emojiCount) < 0) {
-                MessageBox(NULL, "Failed to render emojis", "Error", MB_OK | MB_ICONERROR);
-                sft_freefont(sft.font);
-                return -1;
-            }
-            printf("Rendered %d emojis\n", emojiCount);
             return 0;
         }
 
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
-
-            clear_backbuffer(0xFFFFFFFF);
-
-            // Render emojis in a table-like grid
-            int margin = 10;
-            int x = margin;
-            int y = margin;
-            int max_height = 0;
-
-            for (uint16_t i = 0; i < emojiCount; i++) {
-                draw_emoji(&emojis[i], x, y);
-                x += EMOJI_SIZE + margin;
-                max_height = max(max_height, emojis[i].height);
-
-                // Move to next row if needed
-                if ((i + 1) % COLS_PER_ROW == 0) {
-                    x = margin;
-                    y += max_height + margin;
-                    max_height = 0;
-                }
-
-                // Check if we exceed window height
-                if (y + EMOJI_SIZE > WINDOW_HEIGHT) {
-                    break; // Stop rendering if we run out of space
-                }
-            }
-
-            StretchDIBits(hdc, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT,
-                          0, 0, backbuffer.width, backbuffer.height,
-                          backbuffer.pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
-
+            emoji_viewer_render(&viewer, hdc);
             EndPaint(hwnd, &ps);
             return 0;
         }
 
-        case WM_DESTROY:
-            sft_free_emojis(emojis, emojiCount);
-            sft_freefont(sft.font);
-            if (backbuffer.pixels) free(backbuffer.pixels);
+        case WM_MOUSEWHEEL: {
+            emoji_viewer_handle_scroll(&viewer, GET_WHEEL_DELTA_WPARAM(w_param));
+            InvalidateRect(hwnd, NULL, TRUE);
+            return 0;
+        }
+
+        case WM_SIZE: {
+            // Handle window resizing (optional)
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            emoji_viewer_cleanup(&viewer);
             PostQuitMessage(0);
             return 0;
+        }
     }
 
     return DefWindowProc(hwnd, msg, w_param, l_param);
 }
 
-// Entry point for the Windows application
-int main() {
-    WNDCLASS wc = {0};
-    wc.lpfnWndProc = wnd_proc;
-    wc.lpszClassName = "emoji_window_class";
-    wc.hInstance = GetModuleHandle(NULL);
-    
+// Entry point
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    WNDCLASS wc = {
+        .lpfnWndProc = wnd_proc,
+        .hInstance = hInstance,
+        .lpszClassName = "EmojiViewerClass",
+        .hCursor = LoadCursor(NULL, IDC_ARROW),
+        .hbrBackground = (HBRUSH)(COLOR_WINDOW + 1)
+    };
+
     if (!RegisterClass(&wc)) {
-        MessageBox(NULL, "Window class registration failed", "Error", MB_OK | MB_ICONERROR);
-        return -1;
+        MessageBox(NULL, "Window registration failed", "Error", MB_OK | MB_ICONERROR);
+        return 1;
     }
 
-    HWND hwnd = CreateWindowEx(0, "emoji_window_class", "Emoji Table Window",
-                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                               WINDOW_WIDTH, WINDOW_HEIGHT, NULL, NULL,
-                               wc.hInstance, NULL);
+    HWND hwnd = CreateWindow(
+        wc.lpszClassName, "Emoji Viewer - Scroll to navigate",
+        WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT,
+        EMOJI_VIEWER_WIDTH, EMOJI_VIEWER_HEIGHT,
+        NULL, NULL, hInstance, NULL
+    );
+
     if (!hwnd) {
-        MessageBox(NULL, "Window Creation Failed!", "Error", MB_OK | MB_ICONERROR);
-        return -1;
+        MessageBox(NULL, "Window creation failed", "Error", MB_OK | MB_ICONERROR);
+        return 1;
     }
 
-    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
     MSG msg;
@@ -483,5 +489,5 @@ int main() {
         DispatchMessage(&msg);
     }
 
-    return 0;
+    return (int)msg.wParam;
 }
