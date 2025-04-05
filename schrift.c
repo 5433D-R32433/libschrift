@@ -143,17 +143,17 @@ static int  grow_points (Outline *outl);
 static int  grow_curves (Outline *outl);
 static int  grow_lines  (Outline *outl);
 /* TTF parsing utilities */
-static inline int is_safe_offset(SFT_Font *font, uint_fast32_t offset, uint_fast32_t margin);
+inline int is_safe_offset(SFT_Font *font, uint_fast32_t offset, uint_fast32_t margin);
 static void *csearch(const void *key, const void *base,
 	size_t nmemb, size_t size, int (*compar)(const void *, const void *));
-static int  cmpu16(const void *a, const void *b);
-static int  cmpu32(const void *a, const void *b);
-static inline uint_least8_t  getu8 (SFT_Font *font, uint_fast32_t offset);
-static inline int_least8_t   geti8 (SFT_Font *font, uint_fast32_t offset);
-static inline uint_least16_t getu16(SFT_Font *font, uint_fast32_t offset);
-static inline int_least16_t  geti16(SFT_Font *font, uint_fast32_t offset);
-static inline uint_least32_t getu32(SFT_Font *font, uint_fast32_t offset);
-static int gettable(SFT_Font *font, char tag[4], uint_fast32_t *offset);
+int  cmpu16(const void *a, const void *b);
+int  cmpu32(const void *a, const void *b);
+inline uint_least8_t  getu8 (SFT_Font *font, uint_fast32_t offset);
+inline int_least8_t   geti8 (SFT_Font *font, uint_fast32_t offset);
+inline uint_least16_t getu16(SFT_Font *font, uint_fast32_t offset);
+inline int_least16_t  geti16(SFT_Font *font, uint_fast32_t offset);
+inline uint_least32_t getu32(SFT_Font *font, uint_fast32_t offset);
+int gettable(SFT_Font *font, char tag[4], uint_fast32_t *offset);
 /* codepoint to glyph id translation */
 static int  cmap_fmt4(SFT_Font *font, uint_fast32_t table, SFT_UChar charCode, uint_fast32_t *glyph);
 static int  cmap_fmt6(SFT_Font *font, uint_fast32_t table, SFT_UChar charCode, uint_fast32_t *glyph);
@@ -290,71 +290,100 @@ sft_gmetrics(const SFT *sft, SFT_Glyph glyph, SFT_GMetrics *metrics)
 	return 0;
 }
 
-int
-sft_kerning(const SFT *sft, SFT_Glyph leftGlyph, SFT_Glyph rightGlyph,
-            SFT_Kerning *kerning)
+
+static inline int process_kerning_table(const SFT *sft, char *tag, SFT_Glyph leftGlyph, SFT_Glyph rightGlyph, SFT_Kerning *kerning)
 {
-	void *match;
-	uint_fast32_t offset;
-	unsigned int numTables, numPairs, length, format, flags;
-	int value;
-	uint8_t key[4];
+    void *match;
+    uint_fast32_t offset;
+    unsigned int numTables, numPairs, length, format, flags;
+    int value;
+    uint8_t key[4];
 
-	memset(kerning, 0, sizeof *kerning);
+    printf("Processing kerning table: %s\n", tag);
 
-	if (gettable(sft->font, "kern", &offset) < 0)
-		return 0;
+    if (gettable(sft->font, tag, &offset) < 0) {
+        printf("No %s table found.\n", tag);
+        return 0;
+    }
 
-	/* Read kern table header. */
-	if (!is_safe_offset(sft->font, offset, 4))
-		return -1;
-	if (getu16(sft->font, offset) != 0)
-		return 0;
-	numTables = getu16(sft->font, offset + 2);
-	offset += 4;
+    numTables = getu16(sft->font, offset + 2);
+    offset += 4;
 
-	while (numTables > 0) {
-		/* Read subtable header. */
-		if (!is_safe_offset(sft->font, offset, 6))
-			return -1;
-		length = getu16(sft->font, offset + 2);
-		format = getu8 (sft->font, offset + 4);
-		flags  = getu8 (sft->font, offset + 5);
-		offset += 6;
+    printf("Found %d sub-tables in %s table.\n", numTables, tag);
 
-		if (format == 0 && (flags & HORIZONTAL_KERNING) && !(flags & MINIMUM_KERNING)) {
-			/* Read format 0 header. */
-			if (!is_safe_offset(sft->font, offset, 8))
-				return -1;
-			numPairs = getu16(sft->font, offset);
-			offset += 8;
-			/* Look up character code pair via binary search. */
-			key[0] = (leftGlyph  >> 8) & 0xFF;
-			key[1] =  leftGlyph  & 0xFF;
-			key[2] = (rightGlyph >> 8) & 0xFF;
-			key[3] =  rightGlyph & 0xFF;
-			if ((match = bsearch(key, sft->font->memory + offset,
-				numPairs, 6, cmpu32)) != NULL) {
-				
-				value = geti16(sft->font, (uint_fast32_t) ((uint8_t *) match - sft->font->memory + 4));
-				if (flags & CROSS_STREAM_KERNING) {
-					kerning->yShift += value;
-				} else {
-					kerning->xShift += value;
-				}
-			}
+    while (numTables--) {
+        if (!is_safe_offset(sft->font, offset, 6)) {
+            printf("Error: Invalid offset while processing sub-table in %s table.\n", tag);
+            return -1;
+        }
 
-		}
+        length = getu16(sft->font, offset + 2);
+        format = getu8(sft->font, offset + 4);
+        flags  = getu8(sft->font, offset + 5);
+        offset += 6;
 
-		offset += length;
-		--numTables;
-	}
+        printf("Sub-table format: %d, flags: %d\n", format, flags);
 
-	kerning->xShift = kerning->xShift / sft->font->unitsPerEm * sft->xScale;
-	kerning->yShift = kerning->yShift / sft->font->unitsPerEm * sft->yScale;
+        if (format == 0 && (flags & HORIZONTAL_KERNING) && !(flags & MINIMUM_KERNING)) {
+            if (!is_safe_offset(sft->font, offset, 8)) {
+                printf("Error: Invalid offset while processing pairs in %s table.\n", tag);
+                return -1;
+            }
 
-	return 0;
+            numPairs = getu16(sft->font, offset);
+            offset += 8;
+
+            key[0] = (leftGlyph  >> 8) & 0xFF;
+            key[1] =  leftGlyph  & 0xFF;
+            key[2] = (rightGlyph >> 8) & 0xFF;
+            key[3] =  rightGlyph & 0xFF;
+
+            printf("Looking for kerning pair: Glyph 1 (0x%X), Glyph 2 (0x%X)\n", leftGlyph, rightGlyph);
+
+            if ((match = bsearch(key, sft->font->memory + offset, numPairs, 6, cmpu32)) != NULL) {
+                value = geti16(sft->font, (uint_fast32_t)((uint8_t *) match - sft->font->memory + 4));
+                printf("Found kerning value: %d\n", value);
+                if (flags & CROSS_STREAM_KERNING) {
+                    kerning->yShift += value;
+                    printf("Applying vertical kerning (yShift): %d\n", value);
+                } else {
+                    kerning->xShift += value;
+                    printf("Applying horizontal kerning (xShift): %d\n", value);
+                }
+            } else {
+                printf("No kerning pair found for Glyph 1 (0x%X) and Glyph 2 (0x%X)\n", leftGlyph, rightGlyph);
+            }
+        }
+        offset += length;
+    }
+
+    return 1;
 }
+
+int sft_kerning(const SFT *sft, SFT_Glyph leftGlyph, SFT_Glyph rightGlyph, SFT_Kerning *kerning)
+{
+    unsigned int i;
+    char *kernTags[] = {"kern", "GPOS", "Kern2", "GDEF", "GSUB"};
+
+    memset(kerning, 0, sizeof *kerning);
+
+    printf("Starting kerning calculation for Glyph 1 (0x%X) and Glyph 2 (0x%X)\n", leftGlyph, rightGlyph);
+
+    for (i = 0; i < sizeof(kernTags) / sizeof(kernTags[0]); i++) {
+        printf("Checking kerning data in table: %s\n", kernTags[i]);
+        if (!process_kerning_table(sft, kernTags[i], leftGlyph, rightGlyph, kerning)) {
+            printf("Kerning table '%s' did not provide any kerning data.\n", kernTags[i]);
+        }
+    }
+
+    kerning->xShift = kerning->xShift / sft->font->unitsPerEm * sft->xScale;
+    kerning->yShift = kerning->yShift / sft->font->unitsPerEm * sft->yScale;
+
+    printf("Final kerning values after scaling: xShift = %f, yShift = %f\n", kerning->xShift, kerning->yShift);
+
+    return 0;
+}
+
 
 int
 sft_render(const SFT *sft, SFT_Glyph glyph, SFT_Image image)
@@ -675,7 +704,7 @@ grow_lines(Outline *outl)
 	return 0;
 }
 
-static inline int
+inline int
 is_safe_offset(SFT_Font *font, uint_fast32_t offset, uint_fast32_t margin)
 {
 	if (offset > font->size) return 0;
@@ -705,33 +734,33 @@ csearch(const void *key, const void *base,
 }
 
 /* Used as a comparison function for [bc]search(). */
-static int
+int
 cmpu16(const void *a, const void *b)
 {
 	return memcmp(a, b, 2);
 }
 
 /* Used as a comparison function for [bc]search(). */
-static int
+int
 cmpu32(const void *a, const void *b)
 {
 	return memcmp(a, b, 4);
 }
 
-static inline uint_least8_t
+inline uint_least8_t
 getu8(SFT_Font *font, uint_fast32_t offset)
 {
 	assert(offset + 1 <= font->size);
 	return *(font->memory + offset);
 }
 
-static inline int_least8_t
+inline int_least8_t
 geti8(SFT_Font *font, uint_fast32_t offset)
 {
 	return (int_least8_t) getu8(font, offset);
 }
 
-static inline uint_least16_t
+inline uint_least16_t
 getu16(SFT_Font *font, uint_fast32_t offset)
 {
 	assert(offset + 2 <= font->size);
@@ -740,13 +769,13 @@ getu16(SFT_Font *font, uint_fast32_t offset)
 	return (uint_least16_t) (b1 << 8 | b0);
 }
 
-static inline int16_t
+inline int16_t
 geti16(SFT_Font *font, uint_fast32_t offset)
 {
 	return (int_least16_t) getu16(font, offset);
 }
 
-static inline uint32_t
+inline uint32_t
 getu32(SFT_Font *font, uint_fast32_t offset)
 {
 	assert(offset + 4 <= font->size);
@@ -755,7 +784,7 @@ getu32(SFT_Font *font, uint_fast32_t offset)
 	return (uint_least32_t) (b3 << 24 | b2 << 16 | b1 << 8 | b0);
 }
 
-static int
+int
 gettable(SFT_Font *font, char tag[4], uint_fast32_t *offset)
 {
 	void *match;
